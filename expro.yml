@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Exporo ECS Fargate Stack"
+Parameters:
+  AppName:
+    Description: Basic App Name
+    Type: String
+  AppNameFull:
+    Description: Fully qualified App Name (incl. and environment)
+    Type: String
+  Environment:
+    Description: app internal param to define basic behavior
+    Type: String
+  AppContainerName:
+    Description: app's container service name
+    Type: String
+  AppImageName:
+    Description: app's docker image name
+    Type: String
+  VpcCidrBlock:
+    Description: parent cidr block of both subnets's cidr block
+    Type: String
+  SubnetACidrBlock:
+    Type: String
+  SubnetBCidrBlock:
+    Type: String
+
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Sub ${VpcCidrBlock}
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-vpc"
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-igw"
+  VPCGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Sub ${SubnetACidrBlock}
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-SubnetA"
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: !Sub ${SubnetBCidrBlock}
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-SubnetB"
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-rtb"
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGateway
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetB
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Exporo-CF-ECS-SecurityGroup"
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-sg"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '8080'
+        ToPort: '8080'
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AppNameFull}
+
+  DefaultTargetGroup:
+    Properties:
+      Name: !Sub "${AppNameFull}-tg"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AppNameFull}-lb"
+      SecurityGroups:
+      - !Ref LoadBalancerSecurityGroup
+      Subnets:
+      - !Ref SubnetA
+      - !Ref SubnetB
+      Tags:
+      -
+        Key: Name
+        Value: !Sub "${AppNameFull}-lb"
+
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      -
+        TargetGroupArn: !Ref DefaultTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Access to the load balancer that sits in front of ECS"
+      SecurityGroupIngress:
+      -
+        CidrIp: 0.0.0.0/0
+        IpProtocol: -1
+      Tags:
+      - Key: Name
+        Value: !Sub "${AppNameFull}-lbsg"
+      VpcId: !Ref VPC
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Access to the load balancer that sits in front of ECS"
+      SecurityGroupIngress:
+      - SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        IpProtocol: -1
+      Tags:
+      -
+        Key: Name
+        Value: !Sub "${AppNameFull}-ssg"
+      VpcId: !Ref VPC
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AppNameFull}
+      RetentionInDays: 7
+
+  TaskExecutionServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Resource: "*"
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - ecr:GetAuthorizationToken
+          - Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AppImageName}
+            Effect: Allow
+            Action:
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            - ecr:BatchCheckLayerAvailability
+          - Resource: "*"
+            Effect: Allow
+            Action:
+            - ec2:AuthorizeSecurityGroupIngress
+            - ec2:Describe*
+            - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+            - elasticloadbalancing:Describe*
+            - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+            - elasticloadbalancing:DeregisterTargets
+            - elasticloadbalancing:DescribeTargetGroups
+            - elasticloadbalancing:DescribeTargetHealth
+            - elasticloadbalancing:RegisterTargets
+
+
+  AppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument: |
+        {
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "Service": [ "ecs-tasks.amazonaws.com" ]},
+                "Action": [ "sts:AssumeRole" ]
+            }]
+        }
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Resource: "*"
+            Effect: Allow
+            Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+            - ssm:GetParametersByPath
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: ["FARGATE"]
+      NetworkMode: "awsvpc"
+      Cpu: '1024'
+      Memory: '2048'
+      ExecutionRoleArn: !Ref TaskExecutionServiceRole
+      TaskRoleArn: !Ref AppTaskRole
+      Volumes: []
+      ContainerDefinitions:
+      -   Name: !Sub ${AppContainerName}
+          Cpu: '1024'
+          Essential: 'true'
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AppName}/${AppImageName}:latest
+          Memory: '2048'
+          Environment:
+          - Name: DEPLOYMENT_ENV
+            Value: !Sub ${Environment}
+          - Name: OPS_APP_NAME
+            Value: !Sub ${AppName}
+          PortMappings:
+          - HostPort: 8080
+            ContainerPort: 8080
+          - HostPort: 22
+            ContainerPort: 22
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub /ecs/${AppNameFull}
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: ecs
+  ServiceDefinition:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerListener
+    Properties:
+      Cluster: !Sub ${AppNameFull}
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      DesiredCount: 2
+      LoadBalancers:
+      - ContainerName: !Sub ${AppContainerName}
+        ContainerPort: 8080
+        TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+          - !Ref SecurityGroup
+          Subnets:
+          - !Ref SubnetA
+          - !Ref SubnetB
+      ServiceName: !Sub "${AppNameFull}-svc"
+      TaskDefinition: !Ref AppTaskDefinition
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      Matcher:
+        HttpCode: 200-299
+      TargetType: ip
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: /favicon.ico
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+      - Key: stickiness.enabled
+        Value: true
+      - Key: stickiness.type
+        Value: lb_cookie
+      - Key: stickiness.lb_cookie.duration_seconds
+        Value: 86400
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref LoadBalancerListener
+      Priority: 2
+      Conditions:
+      - Field: path-pattern
+        Values:
+        - /*
+      Actions:
+      - TargetGroupArn: !Ref TargetGroup
+        Type: forward
